@@ -16,7 +16,8 @@ import logging
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    InlineQueryResultAnimation,
+    InlineQueryResultGif,
+    InlineQueryResultMpeg4Gif,
     InlineQueryResultPhoto,
     InlineQueryResultVideo,
     InputMediaAnimation,
@@ -255,14 +256,27 @@ async def inline_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             )
         elif pin.is_gif and (pin.preview_url or pin.thumb_url):
-            results.append(
-                InlineQueryResultAnimation(
-                    id=pin.id,
-                    animation_url=pin.preview_url or pin.thumb_url,
-                    thumbnail_url=pin.thumb_url or pin.preview_url,
-                    title=pin.title or "Pinterest GIF",
+            gif_url = pin.preview_url or pin.thumb_url
+            thumb = pin.thumb_url or pin.preview_url
+            if gif_url.lower().endswith(".gif"):
+                results.append(
+                    InlineQueryResultGif(
+                        id=pin.id,
+                        gif_url=gif_url,
+                        thumbnail_url=thumb,
+                        title=pin.title or "Pinterest GIF",
+                    )
                 )
-            )
+            else:
+                # Pinterest usually serves "gif" pins as an mp4 under the hood.
+                results.append(
+                    InlineQueryResultMpeg4Gif(
+                        id=pin.id,
+                        mpeg4_url=gif_url,
+                        thumbnail_url=thumb,
+                        title=pin.title or "Pinterest GIF",
+                    )
+                )
         elif pin.preview_url:
             results.append(
                 InlineQueryResultPhoto(
