@@ -44,3 +44,8 @@ INLINE_RESULT_LIMIT = int(os.getenv("INLINE_RESULT_LIMIT", "20"))
 # ---- Optional Pinterest login (best-effort, see login_service.py) ---------
 PINTEREST_EMAIL = os.getenv("PINTEREST_EMAIL", "")
 PINTEREST_PASSWORD = os.getenv("PINTEREST_PASSWORD", "")
+
+# ---- Logging ----------------------------------------------------------------
+# Set LOG_LEVEL=DEBUG in Render env vars to see full raw Pinterest payloads
+# in the logs when diagnosing "media load nahi ho paaya" issues.
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()

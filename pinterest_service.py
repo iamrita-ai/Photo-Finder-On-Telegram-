@@ -20,24 +20,46 @@ class PinterestMedia:
 
     def __init__(self, raw: dict):
         self.id: str = str(raw.get("id", ""))
-        self.title: str = (raw.get("title") or raw.get("description") or "").strip()
-        self.pin_url: str = raw.get("url") or f"https://www.pinterest.com/pin/{self.id}/"
+        self.title: str = (raw.get("title") or raw.get("description") or raw.get("alt") or "").strip()
+        self.pin_url: str = raw.get("url") or (
+            f"https://www.pinterest.com/pin/{self.id}/" if self.id else "https://www.pinterest.com"
+        )
         self.media_type: str = raw.get("media_type", "image")
 
         images = raw.get("images") or {}
-        self.thumb_url: Optional[str] = _first_url(images, "236x", "170x", "474x")
-        self.preview_url: Optional[str] = _first_url(images, "736x", "474x", "236x")
-        self.original_url: Optional[str] = _first_url(images, "orig", "736x", "474x")
+        self.thumb_url: Optional[str] = _first_url(images, "236x", "170x", "474x") or _fallback_image_url(raw)
+        self.preview_url: Optional[str] = (
+            _first_url(images, "736x", "474x", "236x") or _fallback_image_url(raw)
+        )
+        self.original_url: Optional[str] = (
+            _first_url(images, "orig", "736x", "474x") or _fallback_image_url(raw)
+        )
 
         self.video_url: Optional[str] = None
         self.video_poster: Optional[str] = None
         if self.media_type == "video":
             video = raw.get("video") or {}
-            formats = [f for f in (video.get("formats") or []) if f.get("url", "").endswith(".mp4")]
+            formats = [f for f in (video.get("formats") or []) if _looks_like_mp4(f.get("url"))]
             best = max(formats, key=lambda f: f.get("width", 0), default=None)
             if best:
                 self.video_url = best.get("url")
-            self.video_poster = video.get("poster") or self.preview_url
+            elif video.get("formats"):
+                # No .mp4 match found (e.g. only HLS) — fall back to the
+                # highest-res format anyway; Telegram can sometimes still
+                # play it, and if not, download_callback/_send_pin handle
+                # the "no url" case gracefully.
+                best_any = max(video["formats"], key=lambda f: f.get("width", 0), default=None)
+                self.video_url = (best_any or {}).get("url")
+            self.video_poster = video.get("poster") or self.preview_url or self.thumb_url
+
+        if not (self.thumb_url or self.preview_url or self.original_url or self.video_url):
+            logger.warning(
+                "No usable media URL found for pin id=%s media_type=%s — raw keys: %s",
+                self.id,
+                self.media_type,
+                list(raw.keys()),
+            )
+            logger.debug("Full raw pin payload for id=%s: %s", self.id, raw)
 
     @property
     def is_video(self) -> bool:
@@ -62,11 +84,39 @@ class PinterestMedia:
 
 
 def _first_url(images: dict, *keys: str) -> Optional[str]:
+    """Handles both {"236x": {"url": "..."}} and {"236x": "https://..."} shapes."""
     for key in keys:
         entry = images.get(key)
-        if entry and entry.get("url"):
+        if isinstance(entry, dict) and entry.get("url"):
             return entry["url"]
+        if isinstance(entry, str) and entry:
+            return entry
     return None
+
+
+def _fallback_image_url(raw: dict) -> Optional[str]:
+    """Covers alternate/older response shapes seen in the wild for this library."""
+    for key in ("image_url", "thumbnail", "thumbnail_url", "src", "cover_url", "photo_url"):
+        val = raw.get(key)
+        if isinstance(val, str) and val:
+            return val
+
+    media = raw.get("media")
+    if isinstance(media, dict):
+        for key in ("url", "poster"):
+            val = media.get(key)
+            if isinstance(val, str) and val:
+                return val
+
+    embed = raw.get("embed")
+    if isinstance(embed, dict) and isinstance(embed.get("src"), str):
+        return embed["src"]
+
+    return None
+
+
+def _looks_like_mp4(url: Optional[str]) -> bool:
+    return bool(url) and ".mp4" in url.lower()
 
 
 class PinterestService:
@@ -86,6 +136,8 @@ class PinterestService:
             return []
 
         pins = result.get("pins") or []
+        if pins:
+            logger.info("First raw pin keys for query=%r: %s", query, list(pins[0].keys()))
         return [PinterestMedia(p) for p in pins[:limit]]
 
     def get_pin(self, pin_url_or_id: str) -> Optional[PinterestMedia]:

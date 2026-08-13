@@ -43,7 +43,7 @@ from pinterest_service import PinterestMedia, PinterestService
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    level=logging.INFO,
+    level=config.LOG_LEVEL,
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("pinterest_bot")
