@@ -126,12 +126,19 @@ async def _do_search(update: Update, context: ContextTypes.DEFAULT_TYPE, query: 
         await status_msg.edit_text("😕 Koi result nahi mila. Doosra keyword try karo.")
         return
 
+    first_pin = await asyncio.to_thread(pinterest.resolve, pins[0])
+    pins[0] = first_pin
+
+    if first_pin.needs_resolve:
+        await status_msg.edit_text("😕 Pinterest se media load nahi ho paaya. Thodi der baad try karo.")
+        return
+
     await db.upsert_user(user.id, user.username, user.first_name)
     await db.increment_search_count(user.id)
     session_id = await db.create_session(user.id, query, [p.to_dict() for p in pins])
 
     await status_msg.delete()
-    await _send_pin(update.effective_chat.id, context, session_id, 0, pins[0], query, len(pins))
+    await _send_pin(update.effective_chat.id, context, session_id, 0, first_pin, query, len(pins))
 
 
 async def _send_pin(
@@ -188,10 +195,17 @@ async def nav_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await db.update_session_index(session_id, index)
     pin = PinterestMedia(pins_raw[index])
+
+    if pin.needs_resolve:
+        pin = await asyncio.to_thread(pinterest.resolve, pin)
+        if pin.needs_resolve:
+            await query.answer("⚠️ Ye media load nahi ho paaya, agla/pichla try karo.", show_alert=True)
+            return
+        await db.update_session_pin(session_id, index, pin.to_dict())
+
     keyboard = build_nav_keyboard(session_id, index, len(pins_raw), pin)
     caption = f"🔎 {doc['query']}\n{pin.title}".strip()[:1024]
 
-    await query.answer()
     try:
         if pin.is_video:
             media = InputMediaVideo(pin.video_url, caption=caption)
@@ -204,6 +218,7 @@ async def nav_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             media = InputMediaPhoto(photo_url, caption=caption)
         await query.edit_message_media(media=media, reply_markup=keyboard)
+        await query.answer()
     except Exception:
         logger.exception("Failed to edit message media for session=%s index=%s", session_id, index)
         await query.answer("⚠️ Load karne mein dikkat aayi, thodi der baad try karo.", show_alert=True)
@@ -220,6 +235,11 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     pin = PinterestMedia(doc["pins"][index])
+    if pin.needs_resolve:
+        pin = await asyncio.to_thread(pinterest.resolve, pin)
+        if not pin.needs_resolve:
+            await db.update_session_pin(session_id, index, pin.to_dict())
+
     await query.answer("📤 Bhej raha hoon...")
     chat_id = query.message.chat_id
 
@@ -241,6 +261,13 @@ async def inline_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     pins = await asyncio.to_thread(pinterest.search, query_text, config.INLINE_RESULT_LIMIT)
+    if not pins:
+        return
+
+    resolved = await asyncio.gather(
+        *(asyncio.to_thread(pinterest.resolve, p) for p in pins), return_exceptions=True
+    )
+    pins = [p for p in resolved if isinstance(p, PinterestMedia) and not p.needs_resolve]
 
     results = []
     for pin in pins:

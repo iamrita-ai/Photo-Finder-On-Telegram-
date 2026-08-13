@@ -39,7 +39,10 @@ if not WEBHOOK_URL:
 
 # ---- Search behaviour -------------------------------------------------------
 DEFAULT_RESULT_LIMIT = int(os.getenv("DEFAULT_RESULT_LIMIT", "10"))
-INLINE_RESULT_LIMIT = int(os.getenv("INLINE_RESULT_LIMIT", "20"))
+# Inline results each require a separate get_pin() call to resolve media URLs
+# (see pinterest_service.resolve) run concurrently — keep this modest to
+# avoid slow inline responses or Pinterest rate-limiting.
+INLINE_RESULT_LIMIT = int(os.getenv("INLINE_RESULT_LIMIT", "10"))
 
 # ---- Optional Pinterest login (best-effort, see login_service.py) ---------
 PINTEREST_EMAIL = os.getenv("PINTEREST_EMAIL", "")

@@ -69,6 +69,13 @@ class PinterestMedia:
     def is_gif(self) -> bool:
         return self.media_type == "gif"
 
+    @property
+    def needs_resolve(self) -> bool:
+        """True when this pin came from search() as a lightweight stub
+        (id/title/url/media_type only) and still needs get_pin() to fetch
+        actual image/video URLs."""
+        return not (self.thumb_url or self.preview_url or self.original_url or self.video_url)
+
     def to_dict(self) -> dict:
         return {
             "id": self.id,
@@ -152,3 +159,21 @@ class PinterestService:
             logger.warning("Pinterest get_pin failed for %r: %s", pin_url_or_id, result.get("error"))
             return None
         return PinterestMedia(result["pin"])
+
+    def resolve(self, pin: PinterestMedia) -> PinterestMedia:
+        """Blocking. Call via asyncio.to_thread from async code.
+
+        search() only returns a lightweight stub (id/title/url/media_type) —
+        no image or video URLs. This fetches the full pin via get_pin() so it
+        can actually be sent to Telegram. If `pin` already has media URLs
+        (e.g. it was already resolved once and cached), this is a no-op.
+        """
+        if not pin.needs_resolve:
+            return pin
+
+        full = self.get_pin(pin.pin_url or pin.id)
+        if full is None:
+            return pin
+        if not full.title:
+            full.title = pin.title
+        return full

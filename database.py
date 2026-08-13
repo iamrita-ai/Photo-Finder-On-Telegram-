@@ -76,6 +76,11 @@ class Database:
     async def update_session_index(self, session_id: str, index: int):
         await self.sessions.update_one({"_id": session_id}, {"$set": {"index": index}})
 
+    async def update_session_pin(self, session_id: str, index: int, pin: dict):
+        """Cache a freshly-resolved pin back into the session so Prev/Next
+        doesn't have to hit Pinterest again for the same index."""
+        await self.sessions.update_one({"_id": session_id}, {"$set": {f"pins.{index}": pin}})
+
     # ---- pinterest login cookies (optional feature) ---------------------
     async def save_pinterest_cookies(self, cookies: list[dict]):
         await self.settings.update_one(
