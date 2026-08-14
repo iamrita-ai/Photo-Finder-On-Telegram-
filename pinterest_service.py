@@ -25,6 +25,27 @@ from py3pin.Pinterest import Pinterest as _Py3PinClient
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# py3-pinterest bug patch: BookmarkManager.reset_bookmark() does a plain
+# `del self.bookmark_map[primary][secondary]` with no existence check, so it
+# crashes with KeyError the first time a brand-new query is searched (there's
+# nothing to reset yet). Patch it to be a safe no-op in that case — this is
+# exactly what "reset" should mean when there was nothing to reset.
+# ---------------------------------------------------------------------------
+try:
+    from py3pin.BookmarkManager import BookmarkManager as _BookmarkManager
+
+    def _safe_reset_bookmark(self, primary, secondary):
+        try:
+            del self.bookmark_map[primary][secondary]
+        except KeyError:
+            pass
+
+    _BookmarkManager.reset_bookmark = _safe_reset_bookmark
+    logger.info("Patched py3pin.BookmarkManager.reset_bookmark (upstream KeyError bug).")
+except Exception:
+    logger.exception("Could not patch py3pin.BookmarkManager.reset_bookmark — search on new queries may crash.")
+
 _IMG_URL_RE = re.compile(
     r'https?://[a-zA-Z0-9\-.]*pinimg\.com/[^\s"\'\\]+\.(?:jpg|jpeg|png|gif|webp)', re.IGNORECASE
 )
@@ -168,6 +189,17 @@ class PinterestService:
 
         try:
             batch = self._client.search(scope="pins", query=query, reset_bookmark=True)
+        except KeyError:
+            # py3-pinterest bug: reset_bookmark does `del bookmark_map[primary][secondary]`
+            # without checking the key exists first, which raises KeyError the first
+            # time a given query is searched. A missing bookmark means there was
+            # nothing to reset anyway, so just retry without reset_bookmark.
+            logger.info("Harmless bookmark-reset KeyError for query=%r — retrying without reset.", query)
+            try:
+                batch = self._client.search(scope="pins", query=query)
+            except Exception:
+                logger.exception("Pinterest search retry (post bookmark KeyError) raised for query=%r", query)
+                return []
         except Exception:
             logger.exception("Pinterest search request raised for query=%r", query)
             return []
