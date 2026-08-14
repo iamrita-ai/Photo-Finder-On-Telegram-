@@ -38,8 +38,8 @@ if not WEBHOOK_URL:
     )
 
 # ---- Search behaviour -------------------------------------------------------
-DEFAULT_RESULT_LIMIT = int(os.getenv("DEFAULT_RESULT_LIMIT", "15"))
-INLINE_RESULT_LIMIT = int(os.getenv("INLINE_RESULT_LIMIT", "15"))
+DEFAULT_RESULT_LIMIT = int(os.getenv("DEFAULT_RESULT_LIMIT", "50"))
+INLINE_RESULT_LIMIT = int(os.getenv("INLINE_RESULT_LIMIT", "50"))
 
 # ---- Optional Pinterest login (see login_service.py / py3-pinterest) ------
 PINTEREST_EMAIL = os.getenv("PINTEREST_EMAIL", "")
