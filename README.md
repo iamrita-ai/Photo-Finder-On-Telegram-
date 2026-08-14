@@ -15,6 +15,12 @@ kiye gaye hain). Pagination se ek se zyada page fetch karke usable results
 collect kiye jaate hain, aur photo/video dono automatically results mein aa
 jaate hain (Pinterest videos ko bhi "pins" hi treat karta hai).
 
+**Video handling:** zyadatar Pinterest video pins sirf HLS (`.m3u8`
+streaming) format mein milte hain, direct `.mp4` nahi — jo Telegram seedha
+play nahi kar sakta. Isliye bot `ffmpeg` se stream-copy remux karke asli
+`.mp4` banata hai phir Telegram par bhejta hai (isliye Dockerfile mein
+`ffmpeg` install hota hai).
+
 ## Files
 
 | File | Purpose |

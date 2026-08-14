@@ -35,6 +35,7 @@ from telegram.ext import (
 
 import config
 import login_service
+import media_utils
 from database import Database
 from pinterest_service import PinterestMedia, PinterestService
 
@@ -55,6 +56,19 @@ pinterest = PinterestService(
 
 def is_owner(user_id: int) -> bool:
     return user_id in config.OWNER_IDS
+
+
+async def _get_video_media(pin: PinterestMedia):
+    """Returns (source, local_path). `source` is a URL string, an open file
+    object, or None if no playable video could be produced. `local_path` is
+    set (and must be cleaned up) only when we remuxed HLS -> mp4 locally."""
+    if pin.video_url:
+        return pin.video_url, None
+    if pin.video_hls_url:
+        path = await media_utils.remux_hls_to_mp4(pin.video_hls_url)
+        if path:
+            return open(path, "rb"), path
+    return None, None
 
 
 def build_nav_keyboard(session_id: str, index: int, total: int, pin: PinterestMedia) -> InlineKeyboardMarkup:
@@ -151,8 +165,28 @@ async def _send_pin(
     caption = f"🔎 {query}\n{pin.title}".strip()[:1024]
 
     if pin.is_video:
-        await context.bot.send_video(chat_id=chat_id, video=pin.video_url, caption=caption, reply_markup=keyboard)
-        return
+        status = None
+        if pin.needs_remux:
+            status = await context.bot.send_message(chat_id=chat_id, text="🎬 Video process ho raha hai, thoda ruko...")
+
+        source, path = await _get_video_media(pin)
+        if source:
+            try:
+                await context.bot.send_video(chat_id=chat_id, video=source, caption=caption, reply_markup=keyboard)
+            finally:
+                if path:
+                    try:
+                        source.close()
+                    except Exception:
+                        pass
+                    media_utils.cleanup(path)
+            if status:
+                await status.delete()
+            return
+
+        if status:
+            await status.edit_text("⚠️ Video process nahi ho paaya, photo bhej raha hoon.")
+        # fall through to photo fallback below
 
     photo_url = pin.preview_url or pin.thumb_url
     if not photo_url:
@@ -189,20 +223,39 @@ async def nav_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = build_nav_keyboard(session_id, index, len(pins_raw), pin)
     caption = f"🔎 {doc['query']}\n{pin.title}".strip()[:1024]
 
+    path = None
+    source = None
     try:
         if pin.is_video:
-            media = InputMediaVideo(pin.video_url, caption=caption)
+            source, path = await _get_video_media(pin)
+            if source:
+                media = InputMediaVideo(source, caption=caption)
+            else:
+                photo_url = pin.preview_url or pin.thumb_url
+                if not photo_url:
+                    await query.answer("⚠️ Ye media load nahi ho paaya.", show_alert=True)
+                    return
+                media = InputMediaPhoto(photo_url, caption=caption)
         else:
             photo_url = pin.preview_url or pin.thumb_url
             if not photo_url:
                 await query.answer("⚠️ Ye media load nahi ho paaya.", show_alert=True)
                 return
             media = InputMediaPhoto(photo_url, caption=caption)
+
         await query.edit_message_media(media=media, reply_markup=keyboard)
         await query.answer()
     except Exception:
         logger.exception("Failed to edit message media for session=%s index=%s", session_id, index)
         await query.answer("⚠️ Load karne mein dikkat aayi, thodi der baad try karo.", show_alert=True)
+    finally:
+        if path:
+            if source:
+                try:
+                    source.close()
+                except Exception:
+                    pass
+            media_utils.cleanup(path)
 
 
 async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -219,8 +272,20 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer("📤 Bhej raha hoon...")
     chat_id = query.message.chat_id
 
-    if pin.is_video and pin.video_url:
-        await context.bot.send_document(chat_id=chat_id, document=pin.video_url, caption="🎬 Original quality video")
+    if pin.is_video:
+        source, path = await _get_video_media(pin)
+        if source:
+            try:
+                await context.bot.send_document(chat_id=chat_id, document=source, caption="🎬 Original quality video")
+            finally:
+                if path:
+                    try:
+                        source.close()
+                    except Exception:
+                        pass
+                    media_utils.cleanup(path)
+        else:
+            await context.bot.send_message(chat_id=chat_id, text="⚠️ Video download nahi ho paaya, thodi der baad try karo.")
     elif pin.original_url:
         await context.bot.send_document(chat_id=chat_id, document=pin.original_url, caption="🖼 Original quality image")
     else:

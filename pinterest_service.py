@@ -49,8 +49,14 @@ except Exception:
 _IMG_URL_RE = re.compile(
     r'https?://[a-zA-Z0-9\-.]*pinimg\.com/[^\s"\'\\]+\.(?:jpg|jpeg|png|gif|webp)', re.IGNORECASE
 )
-_VIDEO_URL_RE = re.compile(
+_VIDEO_MP4_RE = re.compile(
     r'https?://[a-zA-Z0-9\-.]*pinimg\.com/[^\s"\'\\]+\.mp4', re.IGNORECASE
+)
+# Most Pinterest video pins only expose an HLS master playlist (.m3u8), not
+# a direct .mp4 — these are NOT always on a pinimg.com domain, so don't
+# restrict the host.
+_VIDEO_HLS_RE = re.compile(
+    r'https?://[^\s"\'\\]+\.m3u8[^\s"\'\\]*', re.IGNORECASE
 )
 
 # Pinterest encodes size in the URL path, e.g. .../736x/... or .../originals/...
@@ -106,11 +112,14 @@ class PinterestMedia:
         )
 
         images: list = []
-        videos: list = []
+        mp4s: list = []
+        hls: list = []
         _collect_urls(raw, _IMG_URL_RE, images)
-        _collect_urls(raw, _VIDEO_URL_RE, videos)
+        _collect_urls(raw, _VIDEO_MP4_RE, mp4s)
+        _collect_urls(raw, _VIDEO_HLS_RE, hls)
         images = list(dict.fromkeys(images))  # dedupe, keep order
-        videos = list(dict.fromkeys(videos))
+        mp4s = list(dict.fromkeys(mp4s))
+        hls = list(dict.fromkeys(hls))
 
         self.original_url = _pick(images, _ORIGINAL_HINTS) or _pick(images, _PREVIEW_HINTS) or (
             images[0] if images else None
@@ -118,18 +127,27 @@ class PinterestMedia:
         self.preview_url = _pick(images, _PREVIEW_HINTS) or self.original_url
         self.thumb_url = _pick(images, _THUMB_HINTS) or self.preview_url
 
-        self.video_url: Optional[str] = videos[0] if videos else None
+        # Direct playable mp4 if we have one; otherwise remember the HLS
+        # playlist so the bot can remux it with ffmpeg before sending.
+        self.video_url: Optional[str] = mp4s[0] if mp4s else None
+        self.video_hls_url: Optional[str] = hls[0] if hls else None
         self.video_poster: Optional[str] = self.preview_url or self.thumb_url
 
-        self.media_type = "video" if self.video_url else "image"
+        self.media_type = "video" if (self.video_url or self.video_hls_url) else "image"
 
     @property
     def is_video(self) -> bool:
-        return self.media_type == "video" and bool(self.video_url)
+        return self.media_type == "video" and bool(self.video_url or self.video_hls_url)
+
+    @property
+    def needs_remux(self) -> bool:
+        """True when we only have an HLS playlist and need ffmpeg to turn it
+        into an mp4 before Telegram can play it."""
+        return bool(self.video_hls_url and not self.video_url)
 
     @property
     def has_media(self) -> bool:
-        return bool(self.thumb_url or self.preview_url or self.original_url or self.video_url)
+        return bool(self.thumb_url or self.preview_url or self.original_url or self.video_url or self.video_hls_url)
 
     def to_dict(self) -> dict:
         return {
@@ -141,6 +159,7 @@ class PinterestMedia:
             "preview_url": self.preview_url,
             "original_url": self.original_url,
             "video_url": self.video_url,
+            "video_hls_url": self.video_hls_url,
             "video_poster": self.video_poster,
         }
 
@@ -155,6 +174,7 @@ class PinterestMedia:
         obj.preview_url = data.get("preview_url")
         obj.original_url = data.get("original_url")
         obj.video_url = data.get("video_url")
+        obj.video_hls_url = data.get("video_hls_url")
         obj.video_poster = data.get("video_poster")
         return obj
 
