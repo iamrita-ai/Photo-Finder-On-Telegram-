@@ -16,11 +16,8 @@ import logging
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    InlineQueryResultGif,
-    InlineQueryResultMpeg4Gif,
     InlineQueryResultPhoto,
     InlineQueryResultVideo,
-    InputMediaAnimation,
     InputMediaPhoto,
     InputMediaVideo,
     Update,
@@ -49,7 +46,11 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("pinterest_bot")
 
 db = Database(config.MONGO_URI, config.MONGO_DB_NAME)
-pinterest = PinterestService()
+pinterest = PinterestService(
+    email=config.PINTEREST_EMAIL,
+    password=config.PINTEREST_PASSWORD,
+    username=config.PINTEREST_USERNAME,
+)
 
 
 def is_owner(user_id: int) -> bool:
@@ -123,14 +124,10 @@ async def _do_search(update: Update, context: ContextTypes.DEFAULT_TYPE, query: 
     pins = await asyncio.to_thread(pinterest.search, query, config.DEFAULT_RESULT_LIMIT)
 
     if not pins:
-        await status_msg.edit_text("😕 Koi result nahi mila. Doosra keyword try karo.")
-        return
-
-    first_pin = await asyncio.to_thread(pinterest.resolve, pins[0])
-    pins[0] = first_pin
-
-    if first_pin.needs_resolve:
-        await status_msg.edit_text("😕 Pinterest se media load nahi ho paaya. Thodi der baad try karo.")
+        await status_msg.edit_text(
+            "😕 Koi result nahi mila. Doosra keyword try karo, ya thodi der baad phir se try karo "
+            "(Pinterest kabhi kabhi rate-limit kar deta hai)."
+        )
         return
 
     await db.upsert_user(user.id, user.username, user.first_name)
@@ -138,7 +135,7 @@ async def _do_search(update: Update, context: ContextTypes.DEFAULT_TYPE, query: 
     session_id = await db.create_session(user.id, query, [p.to_dict() for p in pins])
 
     await status_msg.delete()
-    await _send_pin(update.effective_chat.id, context, session_id, 0, first_pin, query, len(pins))
+    await _send_pin(update.effective_chat.id, context, session_id, 0, pins[0], query, len(pins))
 
 
 async def _send_pin(
@@ -155,12 +152,6 @@ async def _send_pin(
 
     if pin.is_video:
         await context.bot.send_video(chat_id=chat_id, video=pin.video_url, caption=caption, reply_markup=keyboard)
-        return
-
-    if pin.is_gif and (pin.preview_url or pin.thumb_url):
-        await context.bot.send_animation(
-            chat_id=chat_id, animation=pin.preview_url or pin.thumb_url, caption=caption, reply_markup=keyboard
-        )
         return
 
     photo_url = pin.preview_url or pin.thumb_url
@@ -194,23 +185,13 @@ async def nav_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await db.update_session_index(session_id, index)
-    pin = PinterestMedia(pins_raw[index])
-
-    if pin.needs_resolve:
-        pin = await asyncio.to_thread(pinterest.resolve, pin)
-        if pin.needs_resolve:
-            await query.answer("⚠️ Ye media load nahi ho paaya, agla/pichla try karo.", show_alert=True)
-            return
-        await db.update_session_pin(session_id, index, pin.to_dict())
-
+    pin = PinterestMedia.from_dict(pins_raw[index])
     keyboard = build_nav_keyboard(session_id, index, len(pins_raw), pin)
     caption = f"🔎 {doc['query']}\n{pin.title}".strip()[:1024]
 
     try:
         if pin.is_video:
             media = InputMediaVideo(pin.video_url, caption=caption)
-        elif pin.is_gif and (pin.preview_url or pin.thumb_url):
-            media = InputMediaAnimation(pin.preview_url or pin.thumb_url, caption=caption)
         else:
             photo_url = pin.preview_url or pin.thumb_url
             if not photo_url:
@@ -234,12 +215,7 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("⏱ Session expire ho gaya.", show_alert=True)
         return
 
-    pin = PinterestMedia(doc["pins"][index])
-    if pin.needs_resolve:
-        pin = await asyncio.to_thread(pinterest.resolve, pin)
-        if not pin.needs_resolve:
-            await db.update_session_pin(session_id, index, pin.to_dict())
-
+    pin = PinterestMedia.from_dict(doc["pins"][index])
     await query.answer("📤 Bhej raha hoon...")
     chat_id = query.message.chat_id
 
@@ -261,13 +237,6 @@ async def inline_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     pins = await asyncio.to_thread(pinterest.search, query_text, config.INLINE_RESULT_LIMIT)
-    if not pins:
-        return
-
-    resolved = await asyncio.gather(
-        *(asyncio.to_thread(pinterest.resolve, p) for p in pins), return_exceptions=True
-    )
-    pins = [p for p in resolved if isinstance(p, PinterestMedia) and not p.needs_resolve]
 
     results = []
     for pin in pins:
@@ -282,28 +251,6 @@ async def inline_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     caption=pin.title or "",
                 )
             )
-        elif pin.is_gif and (pin.preview_url or pin.thumb_url):
-            gif_url = pin.preview_url or pin.thumb_url
-            thumb = pin.thumb_url or pin.preview_url
-            if gif_url.lower().endswith(".gif"):
-                results.append(
-                    InlineQueryResultGif(
-                        id=pin.id,
-                        gif_url=gif_url,
-                        thumbnail_url=thumb,
-                        title=pin.title or "Pinterest GIF",
-                    )
-                )
-            else:
-                # Pinterest usually serves "gif" pins as an mp4 under the hood.
-                results.append(
-                    InlineQueryResultMpeg4Gif(
-                        id=pin.id,
-                        mpeg4_url=gif_url,
-                        thumbnail_url=thumb,
-                        title=pin.title or "Pinterest GIF",
-                    )
-                )
         elif pin.preview_url:
             results.append(
                 InlineQueryResultPhoto(
@@ -331,16 +278,18 @@ async def login_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ PINTEREST_EMAIL / PINTEREST_PASSWORD env vars set nahi hain.")
         return
 
-    msg = await update.message.reply_text("🔐 Pinterest login try kar raha hoon (best-effort)...")
-    cookies = await asyncio.to_thread(login_service.attempt_login, config.PINTEREST_EMAIL, config.PINTEREST_PASSWORD)
+    msg = await update.message.reply_text(
+        "🔐 Pinterest login try kar raha hoon (headless Chrome, thoda time lagega)..."
+    )
+    success = await asyncio.to_thread(login_service.attempt_login, pinterest)
 
-    if cookies:
-        await db.save_pinterest_cookies(cookies)
-        await msg.edit_text(f"✅ Login successful — {len(cookies)} cookies MongoDB mein save ho gaye.")
+    if success:
+        await msg.edit_text("✅ Login successful.")
     else:
         await msg.edit_text(
-            "❌ Login fail ho gaya. Pinterest automated logins ko CAPTCHA/2FA se aksar block "
-            "karta hai — ye feature best-effort hai. Search/fetch iske bina bhi fully kaam karta hai."
+            "❌ Login fail ho gaya. Common wajah: container mein Chrome install nahi hai — "
+            "README mein Dockerfile ka commented-out Chrome install block dekho. "
+            "Search feature iske bina bhi fully kaam karta hai."
         )
 
 

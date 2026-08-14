@@ -1,80 +1,114 @@
 """
-Wrapper around the `pinterest-downloader` library
-(https://github.com/x7007x/PinterestDownloader) which scrapes Pinterest's
-public, unauthenticated endpoints - no API key or login needed for search.
+Wrapper around `py3-pinterest` (https://github.com/bstoilov/py3-pinterest) —
+an actively-maintained, fully-fledged Pinterest client (v2.0.0, explicitly
+fixed "Error in search" as of their April 2026 release, which is exactly
+the bug we were hitting with the previous library).
 
-All calls into the underlying library are synchronous (blocking `requests`
-calls), so callers in bot.py must run them via `asyncio.to_thread(...)`
-to avoid blocking the bot's event loop.
+Two lessons baked in after two rounds of production failures against real
+Pinterest responses:
+
+1. Field names are NOT trustworthy across queries/versions - Pinterest's
+   internal API shape varies (and this library returns it close to raw).
+   So instead of reading fixed keys like raw["images"]["236x"]["url"],
+   we recursively scan the *entire* raw pin payload for anything that
+   looks like a Pinterest CDN image/video URL. This is schema-agnostic:
+   as long as Pinterest's CDN domains (i.pinimg.com / v1.pinimg.com) don't
+   change, this keeps working even if the wrapping dict structure does.
+2. search() is paginated via a `bookmark` - we loop until we have enough
+   *usable* (non-empty) results instead of trusting a single page.
 """
 import logging
+import re
 from typing import Optional
 
-from pinterest_downloader import Pinterest
+from py3pin.Pinterest import Pinterest as _Py3PinClient
 
 logger = logging.getLogger(__name__)
 
+_IMG_URL_RE = re.compile(
+    r'https?://[a-zA-Z0-9\-.]*pinimg\.com/[^\s"\'\\]+\.(?:jpg|jpeg|png|gif|webp)', re.IGNORECASE
+)
+_VIDEO_URL_RE = re.compile(
+    r'https?://[a-zA-Z0-9\-.]*pinimg\.com/[^\s"\'\\]+\.mp4', re.IGNORECASE
+)
+
+# Pinterest encodes size in the URL path, e.g. .../736x/... or .../originals/...
+_ORIGINAL_HINTS = ("/originals/",)
+_PREVIEW_HINTS = ("/736x/", "/564x/", "/474x/")
+_THUMB_HINTS = ("/236x/", "/170x/", "/135x136/", "/60x60/")
+
+
+def _collect_urls(obj, pattern: re.Pattern, out: list) -> None:
+    if isinstance(obj, str):
+        out.extend(pattern.findall(obj))
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            _collect_urls(v, pattern, out)
+    elif isinstance(obj, list):
+        for v in obj:
+            _collect_urls(v, pattern, out)
+
+
+def _pick(urls: list, hints: tuple) -> Optional[str]:
+    for hint in hints:
+        for u in urls:
+            if hint in u:
+                return u
+    return None
+
+
+def _first_str(raw: dict, *keys: str) -> Optional[str]:
+    for key in keys:
+        val = raw.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return None
+
 
 class PinterestMedia:
-    """Normalized view of a single Pinterest pin, safe to store as plain dict."""
+    """Normalized view of a single Pinterest pin, built by scanning the raw
+    payload for media URLs rather than trusting a fixed schema."""
 
     def __init__(self, raw: dict):
-        self.id: str = str(raw.get("id", ""))
-        self.title: str = (raw.get("title") or raw.get("description") or raw.get("alt") or "").strip()
-        self.pin_url: str = raw.get("url") or (
-            f"https://www.pinterest.com/pin/{self.id}/" if self.id else "https://www.pinterest.com"
-        )
-        self.media_type: str = raw.get("media_type", "image")
+        self.id: str = str(raw.get("id") or raw.get("pin_id") or "")
 
-        images = raw.get("images") or {}
-        self.thumb_url: Optional[str] = _first_url(images, "236x", "170x", "474x") or _fallback_image_url(raw)
-        self.preview_url: Optional[str] = (
-            _first_url(images, "736x", "474x", "236x") or _fallback_image_url(raw)
-        )
-        self.original_url: Optional[str] = (
-            _first_url(images, "orig", "736x", "474x") or _fallback_image_url(raw)
+        raw_url = raw.get("url")
+        if isinstance(raw_url, str) and "/pin/" in raw_url:
+            self.pin_url = raw_url
+        elif self.id:
+            self.pin_url = f"https://www.pinterest.com/pin/{self.id}/"
+        else:
+            self.pin_url = "https://www.pinterest.com"
+
+        self.title: str = (
+            _first_str(raw, "title", "grid_title", "description", "auto_alt_text", "seo_alt_text") or ""
         )
 
-        self.video_url: Optional[str] = None
-        self.video_poster: Optional[str] = None
-        if self.media_type == "video":
-            video = raw.get("video") or {}
-            formats = [f for f in (video.get("formats") or []) if _looks_like_mp4(f.get("url"))]
-            best = max(formats, key=lambda f: f.get("width", 0), default=None)
-            if best:
-                self.video_url = best.get("url")
-            elif video.get("formats"):
-                # No .mp4 match found (e.g. only HLS) — fall back to the
-                # highest-res format anyway; Telegram can sometimes still
-                # play it, and if not, download_callback/_send_pin handle
-                # the "no url" case gracefully.
-                best_any = max(video["formats"], key=lambda f: f.get("width", 0), default=None)
-                self.video_url = (best_any or {}).get("url")
-            self.video_poster = video.get("poster") or self.preview_url or self.thumb_url
+        images: list = []
+        videos: list = []
+        _collect_urls(raw, _IMG_URL_RE, images)
+        _collect_urls(raw, _VIDEO_URL_RE, videos)
+        images = list(dict.fromkeys(images))  # dedupe, keep order
+        videos = list(dict.fromkeys(videos))
 
-        if not (self.thumb_url or self.preview_url or self.original_url or self.video_url):
-            logger.warning(
-                "No usable media URL found for pin id=%s media_type=%s — raw keys: %s",
-                self.id,
-                self.media_type,
-                list(raw.keys()),
-            )
-            logger.debug("Full raw pin payload for id=%s: %s", self.id, raw)
+        self.original_url = _pick(images, _ORIGINAL_HINTS) or _pick(images, _PREVIEW_HINTS) or (
+            images[0] if images else None
+        )
+        self.preview_url = _pick(images, _PREVIEW_HINTS) or self.original_url
+        self.thumb_url = _pick(images, _THUMB_HINTS) or self.preview_url
+
+        self.video_url: Optional[str] = videos[0] if videos else None
+        self.video_poster: Optional[str] = self.preview_url or self.thumb_url
+
+        self.media_type = "video" if self.video_url else "image"
 
     @property
     def is_video(self) -> bool:
         return self.media_type == "video" and bool(self.video_url)
 
     @property
-    def is_gif(self) -> bool:
-        return self.media_type == "gif"
-
-    @property
-    def needs_resolve(self) -> bool:
-        """True when this pin came from search() as a lightweight stub
-        (id/title/url/media_type only) and still needs get_pin() to fetch
-        actual image/video URLs."""
-        return not (self.thumb_url or self.preview_url or self.original_url or self.video_url)
+    def has_media(self) -> bool:
+        return bool(self.thumb_url or self.preview_url or self.original_url or self.video_url)
 
     def to_dict(self) -> dict:
         return {
@@ -89,91 +123,82 @@ class PinterestMedia:
             "video_poster": self.video_poster,
         }
 
-
-def _first_url(images: dict, *keys: str) -> Optional[str]:
-    """Handles both {"236x": {"url": "..."}} and {"236x": "https://..."} shapes."""
-    for key in keys:
-        entry = images.get(key)
-        if isinstance(entry, dict) and entry.get("url"):
-            return entry["url"]
-        if isinstance(entry, str) and entry:
-            return entry
-    return None
-
-
-def _fallback_image_url(raw: dict) -> Optional[str]:
-    """Covers alternate/older response shapes seen in the wild for this library."""
-    for key in ("image_url", "thumbnail", "thumbnail_url", "src", "cover_url", "photo_url"):
-        val = raw.get(key)
-        if isinstance(val, str) and val:
-            return val
-
-    media = raw.get("media")
-    if isinstance(media, dict):
-        for key in ("url", "poster"):
-            val = media.get(key)
-            if isinstance(val, str) and val:
-                return val
-
-    embed = raw.get("embed")
-    if isinstance(embed, dict) and isinstance(embed.get("src"), str):
-        return embed["src"]
-
-    return None
-
-
-def _looks_like_mp4(url: Optional[str]) -> bool:
-    return bool(url) and ".mp4" in url.lower()
+    @classmethod
+    def from_dict(cls, data: dict) -> "PinterestMedia":
+        obj = cls.__new__(cls)
+        obj.id = data.get("id", "")
+        obj.pin_url = data.get("pin_url", "https://www.pinterest.com")
+        obj.title = data.get("title", "")
+        obj.media_type = data.get("media_type", "image")
+        obj.thumb_url = data.get("thumb_url")
+        obj.preview_url = data.get("preview_url")
+        obj.original_url = data.get("original_url")
+        obj.video_url = data.get("video_url")
+        obj.video_poster = data.get("video_poster")
+        return obj
 
 
 class PinterestService:
-    def __init__(self):
-        self._client = Pinterest()
+    def __init__(self, email: str = "", password: str = "", username: str = "", cred_root: str = "/tmp/pinterest_cred"):
+        # email/password/username are optional — search works anonymously.
+        # They're only used if the owner-only /login command is triggered.
+        self._client = _Py3PinClient(
+            email=email or None,
+            password=password or None,
+            username=username or None,
+            cred_root=cred_root,
+        )
+        self._logged_in = False
 
-    def search(self, query: str, limit: int = 10) -> list[PinterestMedia]:
-        """Blocking. Call via asyncio.to_thread from async code."""
+    def login(self) -> bool:
+        """Blocking (Selenium). Call via asyncio.to_thread. Requires Chrome
+        to be installed in the container — see README."""
         try:
-            result = self._client.search(query, page_size=min(max(limit, 1), 25))
+            self._client.login()
+            self._logged_in = True
+            return True
+        except Exception:
+            logger.exception("py3-pinterest login failed.")
+            return False
+
+    def search(self, query: str, limit: int = 15, max_pages: int = 5) -> list[PinterestMedia]:
+        """Blocking. Call via asyncio.to_thread from async code."""
+        results: list[PinterestMedia] = []
+        seen_ids: set = set()
+
+        try:
+            batch = self._client.search(scope="pins", query=query, reset_bookmark=True)
         except Exception:
             logger.exception("Pinterest search request raised for query=%r", query)
             return []
 
-        if not result.get("ok"):
-            logger.warning("Pinterest search failed for %r: %s", query, result.get("error"))
-            return []
+        pages = 0
+        while batch and len(results) < limit and pages < max_pages:
+            if pages == 0 and batch:
+                logger.info("First raw pin keys for query=%r: %s", query, list(batch[0].keys()))
 
-        pins = result.get("pins") or []
-        if pins:
-            logger.info("First raw pin keys for query=%r: %s", query, list(pins[0].keys()))
-        return [PinterestMedia(p) for p in pins[:limit]]
+            for raw in batch:
+                media = PinterestMedia(raw)
+                if not media.has_media:
+                    continue
+                if media.id and media.id in seen_ids:
+                    continue
+                seen_ids.add(media.id)
+                results.append(media)
+                if len(results) >= limit:
+                    break
 
-    def get_pin(self, pin_url_or_id: str) -> Optional[PinterestMedia]:
-        """Blocking. Call via asyncio.to_thread from async code."""
-        try:
-            result = self._client.get_pin(pin_url_or_id)
-        except Exception:
-            logger.exception("Pinterest get_pin raised for %r", pin_url_or_id)
-            return None
+            pages += 1
+            if len(results) >= limit:
+                break
 
-        if not result.get("ok"):
-            logger.warning("Pinterest get_pin failed for %r: %s", pin_url_or_id, result.get("error"))
-            return None
-        return PinterestMedia(result["pin"])
+            try:
+                batch = self._client.search(scope="pins", query=query)
+            except Exception:
+                logger.exception("Pinterest search pagination raised for query=%r (page %d)", query, pages)
+                break
 
-    def resolve(self, pin: PinterestMedia) -> PinterestMedia:
-        """Blocking. Call via asyncio.to_thread from async code.
+        if not results:
+            logger.warning("No usable results resolved for query=%r after %d page(s).", query, pages)
 
-        search() only returns a lightweight stub (id/title/url/media_type) —
-        no image or video URLs. This fetches the full pin via get_pin() so it
-        can actually be sent to Telegram. If `pin` already has media URLs
-        (e.g. it was already resolved once and cached), this is a no-op.
-        """
-        if not pin.needs_resolve:
-            return pin
-
-        full = self.get_pin(pin.pin_url or pin.id)
-        if full is None:
-            return pin
-        if not full.title:
-            full.title = pin.title
-        return full
+        return results

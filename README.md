@@ -7,14 +7,13 @@ Telegram bot jo Pinterest se photos/videos search karke deta hai — do tareeke 
    aur **📥 Original** (best quality) buttons.
 2. **Inline mode** — kisi bhi chat mein `@your_bot_username query` type karo,
    Telegram ek native gallery-style picker dikhata hai; tap karte hi wahi
-   media us chat mein bhej diya jaata hai. Ye "web mein results, user choose
-   kare" wala behaviour hai — bina custom webapp banaye, purely Telegram ke
-   built-in inline results se.
+   media us chat mein bhej diya jaata hai.
 
-Search public Pinterest endpoints se hoti hai (login ki zaroorat nahi) via
-the [`pinterest-downloader`](https://github.com/x7007x/PinterestDownloader)
-library. Ek optional, best-effort email/password `/login` command bhi diya
-gaya hai (owner-only) — details neeche.
+Search [`py3-pinterest`](https://github.com/bstoilov/py3-pinterest) library
+se hoti hai — ye actively maintained hai (v2.0.0, search bugs explicitly fix
+kiye gaye hain). Pagination se ek se zyada page fetch karke usable results
+collect kiye jaate hain, aur photo/video dono automatically results mein aa
+jaate hain (Pinterest videos ko bhi "pins" hi treat karta hai).
 
 ## Files
 
@@ -22,9 +21,9 @@ gaya hai (owner-only) — details neeche.
 |---|---|
 | `bot.py` | Entry point — handlers + webhook server |
 | `config.py` | Sab env vars yahin se read hote hain |
-| `database.py` | MongoDB (Motor) — users, search sessions, cookies |
-| `pinterest_service.py` | Pinterest search/fetch wrapper |
-| `login_service.py` | Optional best-effort Pinterest email/password login |
+| `database.py` | MongoDB (Motor) — users, search sessions |
+| `pinterest_service.py` | Pinterest search wrapper — schema-agnostic URL extraction + pagination |
+| `login_service.py` | Real Pinterest email/password login (owner-only `/login`) |
 | `Dockerfile` | Render Web Service ke liye |
 | `requirements.txt` | Dependencies |
 | `.env.example` | Sab env vars ka reference |
@@ -33,48 +32,51 @@ gaya hai (owner-only) — details neeche.
 
 1. Is folder ko apne GitHub repo mein push karo.
 2. Render → **New +** → **Web Service** → apna repo select karo → environment
-   **Docker** choose karo (Dockerfile auto-detect ho jaayega).
-3. Environment tab mein ye variables set karo:
+   **Docker** choose karo.
+3. Environment tab mein set karo:
    - `BOT_TOKEN` — BotFather se
-   - `MONGO_URI` — MongoDB Atlas (ya kahin bhi) ka connection string
-   - `MONGO_DB_NAME` (optional, default `pinterest_bot`)
-   - `PINTEREST_EMAIL` / `PINTEREST_PASSWORD` (optional, sirf `/login` ke liye)
-   - `EXTRA_OWNER_IDS` (optional, comma-separated extra admin IDs)
-
-   `PORT` aur `WEBHOOK_URL` (via `RENDER_EXTERNAL_HOSTNAME`) Render khud set
-   kar deta hai — inhe manually set karne ki zaroorat nahi.
+   - `MONGO_URI` — MongoDB connection string
+   - Baaki optional (`.env.example` dekho)
 4. Deploy karo. Boot hote hi bot apna webhook Telegram par set kar leta hai.
-5. BotFather mein apne bot ke liye **Inline Mode** on karna mat bhoolna
-   (`/setinline` in @BotFather) — warna `@bot query` wala picker kaam nahi
-   karega.
+5. BotFather mein **Inline Mode** on karo (`/setinline`) taaki `@bot query`
+   wala picker kaam kare.
+
+## Real login (`/login`, owner-only)
+
+Search **login ke bina fully kaam karta hai**. `/login` sirf tab use karo
+agar tumhe authenticated session chahiye (jaise private/personalized
+results). Ye `py3-pinterest` ke built-in Selenium (headless Chrome) login ka
+use karta hai — **iske liye Chrome container mein hona zaroori hai**, jo
+default Dockerfile mein install nahi hai (image size chhota rakhne ke liye).
+
+Agar `/login` chalana hai:
+1. `Dockerfile` mein commented-out Chrome install block ko uncomment karo.
+2. `PINTEREST_EMAIL`, `PINTEREST_PASSWORD`, `PINTEREST_USERNAME` env vars set
+   karo.
+3. Redeploy karke owner account se `/login` bhejo.
+
+Cookies `cred_root` mein cache hote hain (~15 din tak valid), lekin Render
+ka filesystem ephemeral hai — har naye deploy/restart ke baad dobara login
+karna padega.
 
 ## Admin commands (owner-only)
 
 Hardcoded owner IDs: `6518065496`, `1598576202` (extend via `EXTRA_OWNER_IDS`).
 
 - `/stats` — total users, total searches
-- `/login` — Pinterest email/password se login try karta hai (neeche note dekho)
+- `/login` — Pinterest login try karta hai (upar dekho)
 
-## Pinterest login — important note
+## Debugging
 
-Core search/fetch **login ke bina fully kaam karta hai** — Pinterest ke
-public/unauthenticated endpoints use hote hain. `PINTEREST_EMAIL` /
-`PINTEREST_PASSWORD` sirf tab set karo agar tum owner-only `/login` command
-try karna chahte ho.
-
-Ye login **best-effort** hai: Pinterest automated logins ko CSRF checks,
-device fingerprinting, CAPTCHA aur 2FA se actively block karta hai, aur
-unka internal login endpoint bina notice ke badal sakta hai. Agar `/login`
-fail ho, bot crash nahi hota — bas fail message dikhata hai aur baaki sab
-kaam karta rehta hai. Agar Pinterest apna endpoint change kar de, sirf
-`login_service.py` update karna hoga.
+Agar search results khaali aayein, Render env vars mein `LOG_LEVEL=DEBUG`
+set karo aur redeploy karo — logs mein "First raw pin keys" line dikhegi
+jisse pata chalega Pinterest asal mein kya bhej raha hai.
 
 ## Notes
 
-- Media Telegram ko seedha URL se serve kiya jaata hai (download-then-upload
-  nahi) — isse Render instance par CPU/RAM/disk load kam rehta hai.
-- Search sessions MongoDB mein 24 ghante ke liye cache hote hain (TTL index)
-  taaki Prev/Next/Download baar-baar Pinterest ko na hit karein.
-- Ye ek unofficial Pinterest scraper library use karta hai — Pinterest ke
-  Terms of Service se conflict ho sakta hai; apni responsibility par use
-  karo.
+- Media Telegram ko seedha URL se serve kiya jaata hai — Render instance par
+  CPU/RAM/disk load kam rehta hai.
+- Search sessions MongoDB mein 24 ghante TTL cache hote hain taaki Prev/Next/
+  Download baar-baar Pinterest ko na hit karein.
+- Ye ek unofficial Pinterest client use karta hai — Pinterest ke Terms of
+  Service se conflict ho sakta hai; apni responsibility par use karo.

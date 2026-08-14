@@ -38,15 +38,13 @@ if not WEBHOOK_URL:
     )
 
 # ---- Search behaviour -------------------------------------------------------
-DEFAULT_RESULT_LIMIT = int(os.getenv("DEFAULT_RESULT_LIMIT", "10"))
-# Inline results each require a separate get_pin() call to resolve media URLs
-# (see pinterest_service.resolve) run concurrently — keep this modest to
-# avoid slow inline responses or Pinterest rate-limiting.
-INLINE_RESULT_LIMIT = int(os.getenv("INLINE_RESULT_LIMIT", "10"))
+DEFAULT_RESULT_LIMIT = int(os.getenv("DEFAULT_RESULT_LIMIT", "15"))
+INLINE_RESULT_LIMIT = int(os.getenv("INLINE_RESULT_LIMIT", "15"))
 
-# ---- Optional Pinterest login (best-effort, see login_service.py) ---------
+# ---- Optional Pinterest login (see login_service.py / py3-pinterest) ------
 PINTEREST_EMAIL = os.getenv("PINTEREST_EMAIL", "")
 PINTEREST_PASSWORD = os.getenv("PINTEREST_PASSWORD", "")
+PINTEREST_USERNAME = os.getenv("PINTEREST_USERNAME", "")
 
 # ---- Logging ----------------------------------------------------------------
 # Set LOG_LEVEL=DEBUG in Render env vars to see full raw Pinterest payloads
