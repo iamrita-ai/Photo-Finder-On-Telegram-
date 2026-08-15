@@ -148,9 +148,26 @@ class PinterestMedia:
         images: list = []
         mp4s: list = []
         hls: list = []
-        _collect_urls(raw, _IMG_URL_RE, images)
-        _collect_urls(raw, _VIDEO_MP4_RE, mp4s)
-        _collect_urls(raw, _VIDEO_HLS_RE, hls)
+
+        # Prefer scoping to the pin's own "images"/"videos" sub-objects if
+        # present — scanning the WHOLE raw payload also picks up unrelated
+        # images (pinner avatar, board cover, related-pins widgets), which
+        # caused wrong/broken media (Telegram "Wrong type of web page
+        # content") to get sent. Only fall back to a full-payload scan if
+        # those scoped fields are missing/empty (schema variance).
+        images_obj = raw.get("images")
+        if isinstance(images_obj, (dict, list)):
+            _collect_urls(images_obj, _IMG_URL_RE, images)
+        if not images:
+            _collect_urls(raw, _IMG_URL_RE, images)
+
+        videos_obj = raw.get("videos")
+        if isinstance(videos_obj, (dict, list)):
+            _collect_urls(videos_obj, _VIDEO_MP4_RE, mp4s)
+            _collect_urls(videos_obj, _VIDEO_HLS_RE, hls)
+        if not mp4s and not hls:
+            _collect_urls(raw, _VIDEO_MP4_RE, mp4s)
+            _collect_urls(raw, _VIDEO_HLS_RE, hls)
         images = list(dict.fromkeys(images))
         mp4s = list(dict.fromkeys(mp4s))
         hls = list(dict.fromkeys(hls))
@@ -343,12 +360,14 @@ class PinterestService:
 
     def get_comments(self, pin_id: str, limit: int = 10) -> list:
         """Blocking. Best-effort - Pinterest's comment schema isn't
-        documented by py3-pinterest, so we scan each comment dict for a
-        text-like field."""
+        documented by py3-pinterest, and as of writing their
+        AggregatedCommentFeedResource endpoint returns 404 for most/all
+        pins (looks like Pinterest changed it upstream). We keep trying
+        since it may start working again, but fail quietly."""
         try:
             raw_comments = self._client.get_comments(pin_id=pin_id, reset_bookmark=True)
-        except Exception:
-            logger.exception("Failed to fetch comments for pin_id=%s", pin_id)
+        except Exception as exc:
+            logger.warning("Comments unavailable for pin_id=%s: %s", pin_id, exc)
             return []
 
         texts = []

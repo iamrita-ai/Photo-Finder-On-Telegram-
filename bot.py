@@ -366,7 +366,13 @@ async def comments_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     comments = await asyncio.to_thread(pinterest.get_comments, pin.id)
     if not comments:
-        await context.bot.send_message(chat_id=chat_id, text="No comments found for this pin (or Pinterest didn't return any).")
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "⚠️ Couldn't load comments (Pinterest's comments API isn't reliably "
+                f"accessible right now).\n\nYou can view them directly here: {pin.pin_url}"
+            ),
+        )
         return
 
     lines = [f"💬 Top comments ({len(comments)}):", ""]
