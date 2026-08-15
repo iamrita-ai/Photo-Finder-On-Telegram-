@@ -1,22 +1,23 @@
 """
 Pinterest Fetch Bot - entry point.
 
-Two ways users get media:
+Ways to get media:
 1. Direct search: send any text (or /search <query>) -> bot fetches from
-   Pinterest and posts the result in-chat with Prev/Next/Download/Comments
+   Pinterest and posts results with Prev/Next/Download/Comments/Similar
    buttons. Hitting Next past the last fetched pin transparently loads more
-   results from Pinterest (infinite scroll, not capped at one page).
+   results from Pinterest (infinite scroll, no fixed cap).
 2. Inline mode: type "@<bot_username> <query>" in any chat -> Telegram shows
-   a native picker grid of results; tapping one sends it straight into that
-   chat.
-
-/start also shows a non-repeating random "explore" pin pulled from a
-rotating set of topics, browsable the same Next-to-load-more way.
+   a native picker grid of results.
+3. /explore (also auto-run once on /start): a non-repeating random feed
+   pulled from rotating topics.
+4. /board <pinterest board URL>: browse all pins from a specific board.
 
 Deployed as a Render Web Service via webhook (see Dockerfile / README).
 """
 import asyncio
+import html
 import logging
+import re
 
 from telegram import (
     InlineKeyboardButton,
@@ -37,6 +38,7 @@ from telegram.ext import (
     filters,
 )
 
+import apify_comments
 import config
 import login_service
 import media_utils
@@ -57,6 +59,8 @@ pinterest = PinterestService(
     username=config.PINTEREST_USERNAME,
 )
 
+CAPTION_PARSE_MODE = "HTML"
+
 
 def is_owner(user_id: int) -> bool:
     return user_id in config.OWNER_IDS
@@ -75,6 +79,23 @@ async def _get_video_media(pin: PinterestMedia):
     return None, None
 
 
+def _stats_buttons(pin: PinterestMedia) -> list:
+    """Small non-actionable "chip" buttons showing engagement stats.
+    Pinterest doesn't expose a separate destination per stat type, so
+    tapping these just acknowledges (like the page-number button) —
+    they're informational, not links."""
+    buttons = []
+    if pin.like_count is not None:
+        buttons.append(InlineKeyboardButton(f"❤️ {pin.like_count:,}", callback_data="noop"))
+    if pin.save_count is not None:
+        buttons.append(InlineKeyboardButton(f"📌 {pin.save_count:,}", callback_data="noop"))
+    if pin.comment_count is not None:
+        buttons.append(InlineKeyboardButton(f"💬 {pin.comment_count:,}", callback_data="noop"))
+    if pin.view_count is not None:
+        buttons.append(InlineKeyboardButton(f"👁 {pin.view_count:,}", callback_data="noop"))
+    return buttons
+
+
 def build_nav_keyboard(session_id: str, index: int, pin: PinterestMedia) -> InlineKeyboardMarkup:
     nav_row = []
     if index > 0:
@@ -82,33 +103,45 @@ def build_nav_keyboard(session_id: str, index: int, pin: PinterestMedia) -> Inli
     nav_row.append(InlineKeyboardButton(f"#{index + 1}", callback_data="noop"))
     nav_row.append(InlineKeyboardButton("Next ➡️", callback_data=f"nav:{session_id}:{index + 1}", style="primary"))
 
-    action_row = [
-        InlineKeyboardButton("📥 Original", callback_data=f"dl:{session_id}:{index}", style="success"),
-        InlineKeyboardButton("💬 Comments", callback_data=f"cm:{session_id}:{index}"),
-        InlineKeyboardButton("🔗 Open Pin", url=pin.pin_url),
-    ]
-    return InlineKeyboardMarkup([nav_row, action_row])
+    rows = [nav_row]
 
+    stats_row = _stats_buttons(pin)
+    if stats_row:
+        rows.append(stats_row)
 
-def _stats_line(pin: PinterestMedia) -> str:
-    parts = []
-    if pin.like_count is not None:
-        parts.append(f"❤️ {pin.like_count:,}")
-    if pin.comment_count is not None:
-        parts.append(f"💬 {pin.comment_count:,}")
-    if pin.save_count is not None:
-        parts.append(f"📌 {pin.save_count:,}")
-    if pin.view_count is not None:
-        parts.append(f"👁 {pin.view_count:,}")
-    return "  ".join(parts)
+    rows.append(
+        [
+            InlineKeyboardButton("📥 Original", callback_data=f"dl:{session_id}:{index}", style="success"),
+            InlineKeyboardButton("💬 Comments", callback_data=f"cm:{session_id}:{index}"),
+        ]
+    )
+    rows.append(
+        [
+            InlineKeyboardButton("🔗 Similar", callback_data=f"sim:{session_id}:{index}"),
+            InlineKeyboardButton("🌐 Open Pin", url=pin.pin_url),
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
 
 
 def _build_caption(label: str, pin: PinterestMedia) -> str:
-    lines = [f"🔎 {label}", pin.title] if pin.title else [f"🔎 {label}"]
-    stats = _stats_line(pin)
-    if stats:
-        lines.append(stats)
+    label_esc = html.escape(label)
+    lines = [f"🔎 <b>{label_esc}</b>"]
+    if pin.title:
+        lines.append(f"<b>{html.escape(pin.title)}</b>")
     return "\n".join(lines).strip()[:1024]
+
+
+def _parse_board_ref(raw: str):
+    """Accepts a full pinterest.com board URL or 'username/board-slug'."""
+    raw = raw.strip()
+    m = re.search(r"pinterest\.[a-z.]+/([^/?#]+)/([^/?#]+)/?", raw, re.IGNORECASE)
+    if m:
+        return m.group(1), m.group(2)
+    parts = [p for p in raw.split("/") if p]
+    if len(parts) >= 2:
+        return parts[-2], parts[-1]
+    return None, None
 
 
 # ---------------------------------------------------------------------------
@@ -119,29 +152,31 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await db.upsert_user(user.id, user.username, user.first_name)
     text = (
         f"👋 Hey {user.first_name}!\n\n"
-        "I'm the *Pinterest Fetch Bot*. Send me any keyword "
-        "(like `sunset wallpaper` or `anime aesthetic`) and I'll find "
+        "I'm the <b>Pinterest Fetch Bot</b>. Send me any keyword "
+        "(like <code>sunset wallpaper</code> or <code>anime aesthetic</code>) and I'll find "
         "photos/videos from Pinterest and send them right here.\n\n"
-        f"✨ You can also use inline mode: type `@{context.bot.username} your_query` "
-        "in any chat to get a gallery-style picker.\n\n"
+        f"✨ Inline mode: type <code>@{context.bot.username} your_query</code> "
+        "in any chat for a gallery-style picker.\n\n"
         "Commands:\n"
-        "/search <query> — search Pinterest\n"
+        "/search &lt;query&gt; — search Pinterest\n"
+        "/board &lt;board URL&gt; — browse a specific board\n"
+        "/explore — random non-repeating feed\n"
         "/help — help\n\n"
         "Here's something random to get started 👇"
     )
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await update.message.reply_text(text, parse_mode=CAPTION_PARSE_MODE)
     await _send_explore(update, context)
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Just send a keyword, or use /search <query>.\n"
-        "Use Prev/Next to browse — Next keeps loading more results, there's "
-        "no fixed limit.\n"
-        "📥 Original gets the best quality file, 💬 Comments shows top "
-        "comments on the pin.\n\n"
-        f"Inline mode: type @{context.bot.username} query in any chat for a "
-        "picker grid."
+        "/board <pinterest board URL> — browse all pins on a board\n"
+        "/explore — random non-repeating feed\n\n"
+        "Use Prev/Next to browse — Next keeps loading more results, no fixed limit.\n"
+        "📥 Original = best quality file · 💬 Comments = top comments · "
+        "🔗 Similar = more like this pin.\n\n"
+        f"Inline mode: type @{context.bot.username} query in any chat for a picker grid."
     )
 
 
@@ -152,6 +187,52 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def text_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _do_search(update, context, update.message.text)
+
+
+async def explore_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    await db.upsert_user(user.id, user.username, user.first_name)
+    await _send_explore(update, context)
+
+
+async def board_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /board <pinterest board URL>\n"
+            "e.g. /board https://www.pinterest.com/username/board-name/"
+        )
+        return
+
+    raw = " ".join(context.args)
+    username, board_slug = _parse_board_ref(raw)
+    if not username or not board_slug:
+        await update.message.reply_text(
+            "Couldn't parse that. Send a board URL like "
+            "https://www.pinterest.com/username/board-name/"
+        )
+        return
+
+    status = await update.message.reply_text(f"🔎 Looking up board '{board_slug}' by {username}...")
+    board_id = await asyncio.to_thread(pinterest.find_board_id, username, board_slug)
+    if not board_id:
+        await status.edit_text(
+            "😕 Couldn't find that board. It may be private, misspelled, or "
+            "require login — try /login first (owner-only) if you have Chrome set up."
+        )
+        return
+
+    pins = await asyncio.to_thread(pinterest.search_board, board_id, config.DEFAULT_RESULT_LIMIT)
+    if not pins:
+        await status.edit_text("😕 No pins found — this board may require an authenticated session (/login).")
+        return
+
+    await db.upsert_user(user.id, user.username, user.first_name)
+    label = f"Board: {board_slug}"
+    session_id = await db.create_session(user.id, board_id, [p.to_dict() for p in pins], mode="board", label=label)
+
+    await status.delete()
+    await _send_pin(update.effective_chat.id, context, session_id, 0, pins[0], label)
 
 
 async def _do_search(update: Update, context: ContextTypes.DEFAULT_TYPE, query: str):
@@ -184,7 +265,9 @@ async def _send_explore(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pins = await asyncio.to_thread(pinterest.search_random, set(), config.DEFAULT_RESULT_LIMIT)
     if not pins:
         return
-    session_id = await db.create_session(user.id, "🎲 Explore", [p.to_dict() for p in pins], mode="explore")
+    session_id = await db.create_session(
+        user.id, "explore", [p.to_dict() for p in pins], mode="explore", label="Explore"
+    )
     await _send_pin(update.effective_chat.id, context, session_id, 0, pins[0], "Explore")
 
 
@@ -207,7 +290,10 @@ async def _send_pin(
         source, path = await _get_video_media(pin)
         if source:
             try:
-                await context.bot.send_video(chat_id=chat_id, video=source, caption=caption, reply_markup=keyboard)
+                await context.bot.send_video(
+                    chat_id=chat_id, video=source, caption=caption, reply_markup=keyboard,
+                    parse_mode=CAPTION_PARSE_MODE,
+                )
             finally:
                 if path:
                     try:
@@ -227,11 +313,14 @@ async def _send_pin(
     if not photo_url:
         await context.bot.send_message(chat_id=chat_id, text="⚠️ Couldn't load this media, try Next.")
         return
-    await context.bot.send_photo(chat_id=chat_id, photo=photo_url, caption=caption, reply_markup=keyboard)
+    await context.bot.send_photo(
+        chat_id=chat_id, photo=photo_url, caption=caption, reply_markup=keyboard,
+        parse_mode=CAPTION_PARSE_MODE,
+    )
 
 
 # ---------------------------------------------------------------------------
-# Callback buttons (Prev / Next / Download original / Comments)
+# Callback buttons
 # ---------------------------------------------------------------------------
 async def nav_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -260,6 +349,10 @@ async def nav_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         exclude_ids = {p["id"] for p in pins_raw if p.get("id")}
         if mode == "explore":
             more = await asyncio.to_thread(pinterest.search_random, exclude_ids, config.DEFAULT_RESULT_LIMIT)
+        elif mode == "board":
+            more = await asyncio.to_thread(
+                pinterest.board_more, doc["query"], exclude_ids, config.DEFAULT_RESULT_LIMIT
+            )
         else:
             more = await asyncio.to_thread(
                 pinterest.search_more, doc["query"], exclude_ids, config.DEFAULT_RESULT_LIMIT
@@ -274,7 +367,7 @@ async def nav_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await db.update_session_index(session_id, index)
     pin = PinterestMedia.from_dict(pins_raw[index])
     keyboard = build_nav_keyboard(session_id, index, pin)
-    label = doc["query"] if mode == "search" else "Explore"
+    label = doc.get("label", doc["query"])
     caption = _build_caption(label, pin)
 
     path = None
@@ -283,19 +376,19 @@ async def nav_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if pin.is_video:
             source, path = await _get_video_media(pin)
             if source:
-                media = InputMediaVideo(source, caption=caption)
+                media = InputMediaVideo(source, caption=caption, parse_mode=CAPTION_PARSE_MODE)
             else:
                 photo_url = pin.preview_url or pin.thumb_url
                 if not photo_url:
                     await query.answer("⚠️ Couldn't load this media.", show_alert=True)
                     return
-                media = InputMediaPhoto(photo_url, caption=caption)
+                media = InputMediaPhoto(photo_url, caption=caption, parse_mode=CAPTION_PARSE_MODE)
         else:
             photo_url = pin.preview_url or pin.thumb_url
             if not photo_url:
                 await query.answer("⚠️ Couldn't load this media.", show_alert=True)
                 return
-            media = InputMediaPhoto(photo_url, caption=caption)
+            media = InputMediaPhoto(photo_url, caption=caption, parse_mode=CAPTION_PARSE_MODE)
 
         await query.edit_message_media(media=media, reply_markup=keyboard)
         await query.answer()
@@ -364,13 +457,18 @@ async def comments_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=chat_id, text="⚠️ Can't fetch comments for this pin.")
         return
 
-    comments = await asyncio.to_thread(pinterest.get_comments, pin.id)
+    comments = []
+    if config.APIFY_API_TOKEN:
+        comments = await asyncio.to_thread(apify_comments.fetch_comments, config.APIFY_API_TOKEN, pin.pin_url)
+    if not comments:
+        comments = await asyncio.to_thread(pinterest.get_comments, pin.id)
+
     if not comments:
         await context.bot.send_message(
             chat_id=chat_id,
             text=(
-                "⚠️ Couldn't load comments (Pinterest's comments API isn't reliably "
-                f"accessible right now).\n\nYou can view them directly here: {pin.pin_url}"
+                "⚠️ Couldn't load comments.\n\n"
+                f"You can view them directly here: {pin.pin_url}"
             ),
         )
         return
@@ -378,6 +476,33 @@ async def comments_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = [f"💬 Top comments ({len(comments)}):", ""]
     lines += [f"• {c}" for c in comments]
     await context.bot.send_message(chat_id=chat_id, text="\n".join(lines)[:4000])
+
+
+async def similar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    _, session_id, index_str = query.data.split(":")
+    index = int(index_str)
+
+    doc = await db.get_session(session_id)
+    if not doc:
+        await query.answer("⏱ Session expired.", show_alert=True)
+        return
+
+    pin = PinterestMedia.from_dict(doc["pins"][index])
+    seed_query = " ".join((pin.title or "trending").split()[:6])
+
+    await query.answer("🔎 Finding similar pins...")
+    pins = await asyncio.to_thread(pinterest.search, seed_query, config.DEFAULT_RESULT_LIMIT)
+    chat_id = query.message.chat_id
+
+    if not pins:
+        await context.bot.send_message(chat_id=chat_id, text="😕 Couldn't find similar pins.")
+        return
+
+    user_id = query.from_user.id
+    label = f"Similar to: {seed_query}"
+    new_session_id = await db.create_session(user_id, seed_query, [p.to_dict() for p in pins], mode="search", label=label)
+    await _send_pin(chat_id, context, new_session_id, 0, pins[0], label)
 
 
 # ---------------------------------------------------------------------------
@@ -506,12 +631,15 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_cmd))
     application.add_handler(CommandHandler("search", search_command))
+    application.add_handler(CommandHandler("explore", explore_command))
+    application.add_handler(CommandHandler("board", board_command))
     application.add_handler(CommandHandler("login", login_cmd))
     application.add_handler(CommandHandler("stats", stats_cmd))
     application.add_handler(CommandHandler("broadcast", broadcast_cmd))
     application.add_handler(CallbackQueryHandler(nav_callback, pattern=r"^(nav:|noop)"))
     application.add_handler(CallbackQueryHandler(download_callback, pattern=r"^dl:"))
     application.add_handler(CallbackQueryHandler(comments_callback, pattern=r"^cm:"))
+    application.add_handler(CallbackQueryHandler(similar_callback, pattern=r"^sim:"))
     application.add_handler(InlineQueryHandler(inline_search))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_search))
     application.add_error_handler(error_handler)

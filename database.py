@@ -60,14 +60,15 @@ class Database:
         return [doc["user_id"] async for doc in cursor]
 
     # ---- search / explore sessions --------------------------------------
-    async def create_session(self, user_id: int, query: str, pins: list, mode: str = "search") -> str:
+    async def create_session(self, user_id: int, query: str, pins: list, mode: str = "search", label: str = None) -> str:
         session_id = secrets.token_urlsafe(6)
         await self.sessions.insert_one(
             {
                 "_id": session_id,
                 "user_id": user_id,
-                "query": query,
-                "mode": mode,  # "search" or "explore"
+                "query": query,  # pagination key (search query text or board_id)
+                "label": label or query,  # human-readable, shown in captions
+                "mode": mode,  # "search" | "explore" | "board"
                 "pins": pins,
                 "index": 0,
                 "created_at": datetime.now(timezone.utc),

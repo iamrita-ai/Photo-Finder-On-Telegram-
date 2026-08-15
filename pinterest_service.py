@@ -273,14 +273,16 @@ class PinterestService:
             return False
 
     # -- internal: shared pagination loop --------------------------------
-    def _collect(self, query: str, first_batch: list, limit: int, max_pages: int, seen_ids: set) -> list:
+    def _collect(self, label: str, first_batch: list, limit: int, max_pages: int, seen_ids: set, next_page_fn) -> list:
+        """Generic pagination loop — works for search(), board_feed(), etc.
+        `next_page_fn` is a zero-arg callable that fetches the next page."""
         results: list = []
         batch = first_batch
         pages = 0
 
         while batch and len(results) < limit and pages < max_pages:
             if pages == 0 and batch:
-                logger.info("First raw pin keys for query=%r: %s", query, list(batch[0].keys()))
+                logger.info("First raw pin keys for %s: %s", label, list(batch[0].keys()))
 
             for raw in batch:
                 media = PinterestMedia(raw)
@@ -299,13 +301,13 @@ class PinterestService:
                 break
 
             try:
-                batch = self._client.search(scope="pins", query=query)
+                batch = next_page_fn()
             except Exception:
-                logger.exception("Pinterest search pagination raised for query=%r (page %d)", query, pages)
+                logger.exception("Pagination raised for %s (page %d)", label, pages)
                 break
 
         if not results:
-            logger.warning("No usable results resolved for query=%r after %d page(s).", query, pages)
+            logger.warning("No usable results resolved for %s after %d page(s).", label, pages)
         return results
 
     def search(self, query: str, limit: int = 15, max_pages: int = 5) -> list:
@@ -328,7 +330,10 @@ class PinterestService:
             logger.exception("Pinterest search request raised for query=%r", query)
             return []
 
-        return self._collect(query, batch, limit, max_pages, seen_ids=set())
+        return self._collect(
+            f"query={query!r}", batch, limit, max_pages, set(),
+            lambda: self._client.search(scope="pins", query=query),
+        )
 
     def search_more(self, query: str, exclude_ids: set, limit: int = 15, max_pages: int = 5) -> list:
         """Blocking. Continues pagination for `query` from wherever the
@@ -339,7 +344,10 @@ class PinterestService:
         except Exception:
             logger.exception("Pinterest search_more raised for query=%r", query)
             return []
-        return self._collect(query, batch, limit, max_pages, seen_ids=exclude_ids)
+        return self._collect(
+            f"query={query!r} (more)", batch, limit, max_pages, exclude_ids,
+            lambda: self._client.search(scope="pins", query=query),
+        )
 
     def search_random(self, exclude_ids: set, limit: int = 10, topics_to_try: int = 5) -> list:
         """Blocking. Fetches a batch of pins from randomly rotated topics
@@ -357,6 +365,58 @@ class PinterestService:
                 if len(results) >= limit:
                     return results
         return results
+
+    # -- board search -------------------------------------------------
+    def find_board_id(self, username: str, board_slug: str) -> Optional[str]:
+        """Blocking. Looks up a board's id from a username + board name/slug
+        (as parsed from a pinterest.com/<username>/<board>/ URL)."""
+        try:
+            boards = self._client.boards(username=username)
+        except Exception:
+            logger.exception("Failed to fetch boards for username=%r", username)
+            return None
+
+        target = board_slug.strip().lower().replace("-", " ").replace("_", " ")
+        for b in boards or []:
+            name = str(b.get("name") or "").strip().lower()
+            url = str(b.get("url") or "")
+            slug = url.rstrip("/").split("/")[-1].lower()
+            if name == target or slug == board_slug.strip().lower():
+                return str(b.get("id") or "") or None
+        return None
+
+    def search_board(self, board_id: str, limit: int = 15, max_pages: int = 5) -> list:
+        """Blocking. Fresh fetch of a board's pins."""
+        try:
+            batch = self._client.board_feed(board_id=board_id, reset_bookmark=True)
+        except KeyError:
+            try:
+                batch = self._client.board_feed(board_id=board_id)
+            except Exception:
+                logger.exception("board_feed retry failed for board_id=%r", board_id)
+                return []
+        except Exception:
+            # Some boards 403 anonymously (see py3-pinterest issue #214) —
+            # this usually means it needs an authenticated session (/login).
+            logger.exception("board_feed failed for board_id=%r (may require /login)", board_id)
+            return []
+
+        return self._collect(
+            f"board_id={board_id!r}", batch, limit, max_pages, set(),
+            lambda: self._client.board_feed(board_id=board_id),
+        )
+
+    def board_more(self, board_id: str, exclude_ids: set, limit: int = 15, max_pages: int = 5) -> list:
+        """Blocking. Continues pagination for a board (load more)."""
+        try:
+            batch = self._client.board_feed(board_id=board_id)
+        except Exception:
+            logger.exception("board_more raised for board_id=%r", board_id)
+            return []
+        return self._collect(
+            f"board_id={board_id!r} (more)", batch, limit, max_pages, exclude_ids,
+            lambda: self._client.board_feed(board_id=board_id),
+        )
 
     def get_comments(self, pin_id: str, limit: int = 10) -> list:
         """Blocking. Best-effort - Pinterest's comment schema isn't
