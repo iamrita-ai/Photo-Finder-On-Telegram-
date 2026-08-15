@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Env
+.env
+.env.*
+!.env.example
+
+# Pinterest login cache
+cred_root/
+*.wdm/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Logs
+*.log
+
