@@ -46,12 +46,6 @@ PINTEREST_EMAIL = os.getenv("PINTEREST_EMAIL", "")
 PINTEREST_PASSWORD = os.getenv("PINTEREST_PASSWORD", "")
 PINTEREST_USERNAME = os.getenv("PINTEREST_USERNAME", "")
 
-# ---- Optional: Apify Pinterest Comments Scraper (paid, third-party) -------
-# https://apify.com/easyapi/pinterest-comments-scraper — used as the
-# primary comments source since Pinterest's own comment endpoint is broken
-# upstream. Leave blank to skip (bot falls back to a best-effort method).
-APIFY_API_TOKEN = os.getenv("APIFY_API_TOKEN", "")
-
 # ---- Logging ----------------------------------------------------------------
 # Set LOG_LEVEL=DEBUG in Render env vars to see full raw Pinterest payloads
 # in the logs when diagnosing "media load nahi ho paaya" issues.

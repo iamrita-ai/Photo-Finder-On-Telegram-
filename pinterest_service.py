@@ -141,9 +141,12 @@ class PinterestMedia:
         else:
             self.pin_url = "https://www.pinterest.com"
 
-        self.title: str = (
-            _first_str(raw, "title", "grid_title", "description", "auto_alt_text", "seo_alt_text") or ""
-        )
+        self.title: str = _first_str(raw, "title", "grid_title") or ""
+        self.description: str = _first_str(raw, "description", "auto_alt_text", "seo_alt_text") or ""
+        if not self.title:
+            self.title, self.description = self.description, ""
+        elif self.description == self.title:
+            self.description = ""
 
         images: list = []
         mp4s: list = []
@@ -215,6 +218,7 @@ class PinterestMedia:
         return {
             "id": self.id,
             "title": self.title,
+            "description": self.description,
             "pin_url": self.pin_url,
             "media_type": self.media_type,
             "thumb_url": self.thumb_url,
@@ -235,6 +239,7 @@ class PinterestMedia:
         obj.id = data.get("id", "")
         obj.pin_url = data.get("pin_url", "https://www.pinterest.com")
         obj.title = data.get("title", "")
+        obj.description = data.get("description", "")
         obj.media_type = data.get("media_type", "image")
         obj.thumb_url = data.get("thumb_url")
         obj.preview_url = data.get("preview_url")
@@ -417,22 +422,3 @@ class PinterestService:
             f"board_id={board_id!r} (more)", batch, limit, max_pages, exclude_ids,
             lambda: self._client.board_feed(board_id=board_id),
         )
-
-    def get_comments(self, pin_id: str, limit: int = 10) -> list:
-        """Blocking. Best-effort - Pinterest's comment schema isn't
-        documented by py3-pinterest, and as of writing their
-        AggregatedCommentFeedResource endpoint returns 404 for most/all
-        pins (looks like Pinterest changed it upstream). We keep trying
-        since it may start working again, but fail quietly."""
-        try:
-            raw_comments = self._client.get_comments(pin_id=pin_id, reset_bookmark=True)
-        except Exception as exc:
-            logger.warning("Comments unavailable for pin_id=%s: %s", pin_id, exc)
-            return []
-
-        texts = []
-        for c in (raw_comments or [])[:limit]:
-            text = _first_str(c, "text", "comment", "body", "message") if isinstance(c, dict) else None
-            if text:
-                texts.append(text)
-        return texts

@@ -3,7 +3,7 @@ Pinterest Fetch Bot - entry point.
 
 Ways to get media:
 1. Direct search: send any text (or /search <query>) -> bot fetches from
-   Pinterest and posts results with Prev/Next/Download/Comments/Similar
+   Pinterest and posts results with Prev/Next/Download/Similar
    buttons. Hitting Next past the last fetched pin transparently loads more
    results from Pinterest (infinite scroll, no fixed cap).
 2. Inline mode: type "@<bot_username> <query>" in any chat -> Telegram shows
@@ -38,7 +38,6 @@ from telegram.ext import (
     filters,
 )
 
-import apify_comments
 import config
 import login_service
 import media_utils
@@ -112,15 +111,10 @@ def build_nav_keyboard(session_id: str, index: int, pin: PinterestMedia) -> Inli
     rows.append(
         [
             InlineKeyboardButton("📥 Original", callback_data=f"dl:{session_id}:{index}", style="success"),
-            InlineKeyboardButton("💬 Comments", callback_data=f"cm:{session_id}:{index}"),
-        ]
-    )
-    rows.append(
-        [
             InlineKeyboardButton("🔗 Similar", callback_data=f"sim:{session_id}:{index}"),
-            InlineKeyboardButton("🌐 Open Pin", url=pin.pin_url),
         ]
     )
+    rows.append([InlineKeyboardButton("🌐 Open Pin", url=pin.pin_url)])
     return InlineKeyboardMarkup(rows)
 
 
@@ -128,8 +122,19 @@ def _build_caption(label: str, pin: PinterestMedia) -> str:
     label_esc = html.escape(label)
     lines = [f"🔎 <b>{label_esc}</b>"]
     if pin.title:
-        lines.append(f"<b>{html.escape(pin.title)}</b>")
-    return "\n".join(lines).strip()[:1024]
+        lines.append(f"<b>{html.escape(pin.title[:200])}</b>")
+    if pin.description:
+        desc = pin.description.strip()
+        if len(desc) > 600:
+            desc = desc[:600].rstrip() + "…"
+        lines.append(f'<blockquote expandable>"{html.escape(desc)}"</blockquote>')
+
+    caption = "\n".join(lines).strip()
+    if len(caption) > 1024:
+        # Truncating a naive [:1024] could cut mid-tag and break Telegram's
+        # HTML parser — drop the description block instead if still too long.
+        caption = "\n".join(lines[:2]).strip()[:1024]
+    return caption
 
 
 def _parse_board_ref(raw: str):
@@ -174,8 +179,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/board <pinterest board URL> — browse all pins on a board\n"
         "/explore — random non-repeating feed\n\n"
         "Use Prev/Next to browse — Next keeps loading more results, no fixed limit.\n"
-        "📥 Original = best quality file · 💬 Comments = top comments · "
-        "🔗 Similar = more like this pin.\n\n"
+        "📥 Original = best quality file · 🔗 Similar = more like this pin.\n\n"
         f"Inline mode: type @{context.bot.username} query in any chat for a picker grid."
     )
 
@@ -217,14 +221,20 @@ async def board_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     board_id = await asyncio.to_thread(pinterest.find_board_id, username, board_slug)
     if not board_id:
         await status.edit_text(
-            "😕 Couldn't find that board. It may be private, misspelled, or "
-            "require login — try /login first (owner-only) if you have Chrome set up."
+            "😕 Couldn't find that board (wrong URL, private board, or Pinterest "
+            "blocked the lookup for anonymous access)."
         )
         return
 
     pins = await asyncio.to_thread(pinterest.search_board, board_id, config.DEFAULT_RESULT_LIMIT)
     if not pins:
-        await status.edit_text("😕 No pins found — this board may require an authenticated session (/login).")
+        await status.edit_text(
+            "😕 Pinterest didn't return any pins for this board.\n\n"
+            "This is a Pinterest-side restriction, not a bug: board pages are "
+            "commonly gated behind a login wall even when search results aren't. "
+            "The only way around it is an authenticated session — set up /login "
+            "(needs Chrome enabled in the Dockerfile, see README) and try again."
+        )
         return
 
     await db.upsert_user(user.id, user.username, user.first_name)
@@ -341,6 +351,19 @@ async def nav_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
         return
 
+    # Answer immediately, BEFORE any slow work below (Pinterest pagination
+    # for "load more", HLS video remuxing). Telegram invalidates callback
+    # queries that aren't answered within a few seconds ("query is too old"
+    # errors) — those steps can take longer than that, so we can't wait
+    # until after they finish. Anything that fails past this point is
+    # reported via a normal chat message instead of a callback alert, since
+    # the query is already spent.
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+    chat_id = query.message.chat_id
     pins_raw = doc["pins"]
     mode = doc.get("mode", "search")
 
@@ -358,7 +381,7 @@ async def nav_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pinterest.search_more, doc["query"], exclude_ids, config.DEFAULT_RESULT_LIMIT
             )
         if not more:
-            await query.answer("😕 No more results right now, try again shortly.", show_alert=True)
+            await context.bot.send_message(chat_id=chat_id, text="😕 No more results right now, try again shortly.")
             return
         more_dicts = [m.to_dict() for m in more]
         await db.append_session_pins(session_id, more_dicts)
@@ -380,21 +403,20 @@ async def nav_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 photo_url = pin.preview_url or pin.thumb_url
                 if not photo_url:
-                    await query.answer("⚠️ Couldn't load this media.", show_alert=True)
+                    await context.bot.send_message(chat_id=chat_id, text="⚠️ Couldn't load this media.")
                     return
                 media = InputMediaPhoto(photo_url, caption=caption, parse_mode=CAPTION_PARSE_MODE)
         else:
             photo_url = pin.preview_url or pin.thumb_url
             if not photo_url:
-                await query.answer("⚠️ Couldn't load this media.", show_alert=True)
+                await context.bot.send_message(chat_id=chat_id, text="⚠️ Couldn't load this media.")
                 return
             media = InputMediaPhoto(photo_url, caption=caption, parse_mode=CAPTION_PARSE_MODE)
 
         await query.edit_message_media(media=media, reply_markup=keyboard)
-        await query.answer()
     except Exception:
         logger.exception("Failed to edit message media for session=%s index=%s", session_id, index)
-        await query.answer("⚠️ Trouble loading that, try again shortly.", show_alert=True)
+        await context.bot.send_message(chat_id=chat_id, text="⚠️ Trouble loading that, try again shortly.")
     finally:
         if path:
             if source:
@@ -437,45 +459,6 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_document(chat_id=chat_id, document=pin.original_url, caption="🖼 Original quality image")
     else:
         await context.bot.send_message(chat_id=chat_id, text="⚠️ No original file available for this pin.")
-
-
-async def comments_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    _, session_id, index_str = query.data.split(":")
-    index = int(index_str)
-
-    doc = await db.get_session(session_id)
-    if not doc:
-        await query.answer("⏱ Session expired.", show_alert=True)
-        return
-
-    pin = PinterestMedia.from_dict(doc["pins"][index])
-    await query.answer("💬 Loading comments...")
-    chat_id = query.message.chat_id
-
-    if not pin.id:
-        await context.bot.send_message(chat_id=chat_id, text="⚠️ Can't fetch comments for this pin.")
-        return
-
-    comments = []
-    if config.APIFY_API_TOKEN:
-        comments = await asyncio.to_thread(apify_comments.fetch_comments, config.APIFY_API_TOKEN, pin.pin_url)
-    if not comments:
-        comments = await asyncio.to_thread(pinterest.get_comments, pin.id)
-
-    if not comments:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=(
-                "⚠️ Couldn't load comments.\n\n"
-                f"You can view them directly here: {pin.pin_url}"
-            ),
-        )
-        return
-
-    lines = [f"💬 Top comments ({len(comments)}):", ""]
-    lines += [f"• {c}" for c in comments]
-    await context.bot.send_message(chat_id=chat_id, text="\n".join(lines)[:4000])
 
 
 async def similar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -638,7 +621,6 @@ def main():
     application.add_handler(CommandHandler("broadcast", broadcast_cmd))
     application.add_handler(CallbackQueryHandler(nav_callback, pattern=r"^(nav:|noop)"))
     application.add_handler(CallbackQueryHandler(download_callback, pattern=r"^dl:"))
-    application.add_handler(CallbackQueryHandler(comments_callback, pattern=r"^cm:"))
     application.add_handler(CallbackQueryHandler(similar_callback, pattern=r"^sim:"))
     application.add_handler(InlineQueryHandler(inline_search))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_search))
