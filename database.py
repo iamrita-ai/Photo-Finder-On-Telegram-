@@ -1,16 +1,16 @@
 """
-Async MongoDB access layer (Motor). Two collections:
+Async MongoDB access layer (Motor). Collections:
 
 - users            -> one doc per Telegram user, search_count, timestamps
-- search_sessions  -> one doc per search, holds the fetched pins so
-                      Prev/Next/Download buttons don't need to re-hit
-                      Pinterest on every click. TTL-expires after 24h.
-- settings         -> single doc used to cache Pinterest login cookies
-                      (see login_service.py)
+- search_sessions  -> one doc per search/explore session, holds fetched pins
+                      so Prev/Next/Download/Comments buttons don't need to
+                      re-hit Pinterest on every click. Supports appending
+                      more pins for infinite-scroll "load more". TTL-expires
+                      after 24h.
 """
 import logging
 import secrets
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Optional
 
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -55,14 +55,19 @@ class Database:
         result = await cursor.to_list(length=1)
         return result[0]["total"] if result else 0
 
-    # ---- search sessions ------------------------------------------------
-    async def create_session(self, user_id: int, query: str, pins: list[dict]) -> str:
+    async def get_all_user_ids(self) -> list:
+        cursor = self.users.find({}, {"user_id": 1})
+        return [doc["user_id"] async for doc in cursor]
+
+    # ---- search / explore sessions --------------------------------------
+    async def create_session(self, user_id: int, query: str, pins: list, mode: str = "search") -> str:
         session_id = secrets.token_urlsafe(6)
         await self.sessions.insert_one(
             {
                 "_id": session_id,
                 "user_id": user_id,
                 "query": query,
+                "mode": mode,  # "search" or "explore"
                 "pins": pins,
                 "index": 0,
                 "created_at": datetime.now(timezone.utc),
@@ -76,14 +81,17 @@ class Database:
     async def update_session_index(self, session_id: str, index: int):
         await self.sessions.update_one({"_id": session_id}, {"$set": {"index": index}})
 
+    async def append_session_pins(self, session_id: str, new_pins: list):
+        await self.sessions.update_one({"_id": session_id}, {"$push": {"pins": {"$each": new_pins}}})
+
     # ---- pinterest login cookies (optional feature) ---------------------
-    async def save_pinterest_cookies(self, cookies: list[dict]):
+    async def save_pinterest_cookies(self, cookies: list):
         await self.settings.update_one(
             {"_id": "pinterest_cookies"},
             {"$set": {"cookies": cookies, "updated_at": datetime.now(timezone.utc)}},
             upsert=True,
         )
 
-    async def get_pinterest_cookies(self) -> Optional[list[dict]]:
+    async def get_pinterest_cookies(self) -> Optional[list]:
         doc = await self.settings.find_one({"_id": "pinterest_cookies"})
         return doc.get("cookies") if doc else None
